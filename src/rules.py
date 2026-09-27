@@ -1,13 +1,34 @@
 """跨海光缆故障与抢修协调领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from datetime import datetime
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, moment, number, text, text_list
 
 
 INITIAL_STATE = "detected"
 CREATE_ROLES = {'noc_operator'}
 ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
 TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+
+NOTICE_PENDING = "pending"
+NOTICE_APPROVED = "approved"
+NOTICE_REJECTED = "rejected"
+NOTICE_REVOKED = "revoked"
+NOTICE_SUPERSEDED = "superseded"
+NOTICE_ACTIVE_STATES = {NOTICE_PENDING, NOTICE_APPROVED}
+NOTICE_TRANSITIONS = {
+    'approve_notice': {NOTICE_PENDING: NOTICE_APPROVED},
+    'reject_notice': {NOTICE_PENDING: NOTICE_REJECTED},
+    'revoke_notice': {NOTICE_PENDING: NOTICE_REVOKED, NOTICE_APPROVED: NOTICE_REVOKED},
+}
+NOTICE_ACTION_ROLES = {
+    'register_notice': {'dispatcher'},
+    'approve_notice': {'fisheries_officer'},
+    'reject_notice': {'fisheries_officer'},
+    'revoke_notice': {'dispatcher', 'fisheries_officer'},
+    'reschedule_notice': {'dispatcher'},
+}
+NOTICE_REGISTERABLE_STATES = {'mobilized', 'surveyed', 'spliced', 'tested'}
 
 
 class DomainRules:
@@ -17,12 +38,16 @@ class DomainRules:
         all_roles = set(CREATE_ROLES)
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
+        for roles in NOTICE_ACTION_ROLES.values():
+            all_roles.update(roles)
         return role == "admin" or role in all_roles
 
     def role_can_create(self, role: str) -> bool:
         return role == "admin" or role in CREATE_ROLES
 
     def role_can_action(self, role: str, action: str) -> bool:
+        if action in NOTICE_ACTION_ROLES:
+            return role == "admin" or role in NOTICE_ACTION_ROLES[action]
         return role == "admin" or role in ACTION_ROLES.get(action, set())
 
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,3 +142,109 @@ class DomainRules:
             summary = "抢修取消"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    # ---- 航行通告 ----
+
+    def validate_notice(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        sea_area = text(data, "sea_area")
+        contact_no = text(data, "contact_no")
+        start = moment(data, "start_at")
+        end = moment(data, "end_at")
+        if end <= start:
+            raise ValidationError("作业结束时间必须晚于开始时间")
+        return {"sea_area": sea_area, "contact_no": contact_no, "start_at": start, "end_at": end}
+
+    def check_notice_overlap(self, sea_area: str, start: datetime, end: datetime, others: Iterable[Dict[str, Any]], exclude_record_id: int = None) -> None:
+        for item in others:
+            if item.get("state") not in NOTICE_ACTIVE_STATES:
+                continue
+            if item.get("sea_area") != sea_area:
+                continue
+            if exclude_record_id is not None and item.get("record_id") == exclude_record_id:
+                continue
+            if start.isoformat() < item["end_at"] and end.isoformat() > item["start_at"]:
+                raise Conflict("同一海域时段重叠的通告只能有一份（冲突联系单：%s）" % item.get("contact_no", ""))
+
+    def require_record_state_for_notice(self, record: Dict[str, Any]) -> None:
+        if record["state"] not in NOTICE_REGISTERABLE_STATES:
+            raise Conflict("抢修船动员后才能登记航行通告")
+
+    def require_no_active_notice(self, latest: Optional[Dict[str, Any]]) -> None:
+        if latest is not None and latest["state"] in NOTICE_ACTIVE_STATES:
+            raise Conflict("当前联系单仍有效，不能重复登记；如需调整作业期请办理顺延")
+
+    def require_notice_transition(self, notice: Dict[str, Any], action: str) -> str:
+        allowed = NOTICE_TRANSITIONS.get(action, {}).get(notice["state"])
+        if allowed is None:
+            raise Conflict("通告当前状态不允许执行%s" % action)
+        return allowed
+
+    def validate_notice_action(self, action: str, data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        if action == "approve_notice":
+            changes = {"receipt_no": text(data, "receipt_no")}
+            return changes, "渔政已同意作业，回执号%s" % changes["receipt_no"]
+        if action == "reject_notice":
+            changes = {"reject_reason": text(data, "reject_reason")}
+            return changes, "渔政退回：%s" % changes["reject_reason"]
+        if action == "revoke_notice":
+            reason = text(data, "revoke_reason")
+            changes = {"revoke_reason": reason}
+            return changes, "通告已撤销：%s" % reason
+        raise ValidationError("未知通告操作")
+
+    def validate_reschedule(self, notice: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+        if notice["state"] != NOTICE_APPROVED:
+            raise Conflict("只有已同意的通告才能办理作业期顺延")
+        sea_area = text(data, "sea_area") if data.get("sea_area") else notice["sea_area"]
+        contact_no = text(data, "contact_no") if data.get("contact_no") else notice["contact_no"]
+        start = moment(data, "start_at") if data.get("start_at") else datetime.fromisoformat(notice["start_at"].replace("Z", "+00:00"))
+        end = moment(data, "end_at")
+        if end <= start:
+            raise ValidationError("作业结束时间必须晚于开始时间")
+        if end.isoformat() <= notice["end_at"]:
+            raise ValidationError("顺延后的结束时间必须晚于原作业期")
+        return {"sea_area": sea_area, "contact_no": contact_no, "start_at": start, "end_at": end}
+
+    @staticmethod
+    def notice_block_reason(latest: Optional[Dict[str, Any]], now: datetime) -> Optional[str]:
+        if latest is None:
+            return "航行通告尚未登记，渔政同意前勘察不能开始"
+        state = latest["state"]
+        if state == NOTICE_PENDING:
+            if latest.get("supersedes_id"):
+                return "作业期已顺延，原回执失效，新时段（联系单%s）尚待渔政确认，勘察不能开始" % latest.get("contact_no", "")
+            return "等待渔政确认（联系单%s），勘察不能开始" % latest.get("contact_no", "")
+        if state == NOTICE_REJECTED:
+            return "渔政已退回（联系单%s，原因：%s），请换新联系单重新登记" % (latest.get("contact_no", ""), latest.get("reject_reason", ""))
+        if state == NOTICE_REVOKED:
+            return "通告已撤销（原因：%s），请重新登记" % latest.get("revoke_reason", "")
+        if state == NOTICE_SUPERSEDED:
+            return "原作业期已顺延，原回执失效，需按新时段重新取得渔政确认"
+        if state == NOTICE_APPROVED:
+            if now.isoformat() >= latest["end_at"]:
+                return "回执%s已超过作业期，需重新确认" % latest.get("receipt_no", "")
+            return None
+        return "通告状态不可用于勘察"
+
+    def notice_summary(self, latest: Optional[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+        if latest is None:
+            return {"registered": False, "valid_receipt": None, "blocked": True, "block_reason": self.notice_block_reason(None, now)}
+        block_reason = self.notice_block_reason(latest, now)
+        valid = bool(latest["state"] == NOTICE_APPROVED and block_reason is None)
+        return {
+            "registered": True,
+            "state": latest["state"],
+            "contact_no": latest.get("contact_no"),
+            "sea_area": latest.get("sea_area"),
+            "start_at": latest.get("start_at"),
+            "end_at": latest.get("end_at"),
+            "receipt_no": latest.get("receipt_no") if valid else None,
+            "valid_receipt": (
+                {"receipt_no": latest.get("receipt_no"), "start_at": latest.get("start_at"), "end_at": latest.get("end_at"), "sea_area": latest.get("sea_area"), "contact_no": latest.get("contact_no")}
+                if valid else None
+            ),
+            "reject_reason": latest.get("reject_reason"),
+            "revoke_reason": latest.get("revoke_reason"),
+            "blocked": block_reason is not None,
+            "block_reason": block_reason,
+        }

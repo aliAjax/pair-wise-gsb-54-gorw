@@ -1,5 +1,6 @@
 """领域基础类型与输入校验。"""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 
@@ -95,3 +96,20 @@ def text_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[str]:
     if len(value) < minimum:
         raise ValidationError("%s至少需要%s项" % (key, minimum))
     return [item.strip() for item in value]
+
+
+def moment(data: Dict[str, Any], key: str) -> datetime:
+    """解析ISO8601时间；无时区输入按UTC处理，统一返回带时区的datetime。"""
+    raw = text(data, key)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError("%s必须是ISO8601时间" % key) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def to_iso(value: datetime) -> str:
+    """带时区时间统一输出为UTC的ISO8601文本，便于字符串比较。"""
+    return value.astimezone(timezone.utc).isoformat()

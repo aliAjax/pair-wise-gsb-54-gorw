@@ -9,25 +9,48 @@
     main { max-width: 960px; margin: auto; }
     button { padding: .55rem .9rem; cursor: pointer; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .card { border: 1px solid #d7dde3; border-radius: 8px; padding: .8rem 1rem; }
+    .ok { color: #1a7f37; font-weight: 600; }
+    .block { color: #b42318; font-weight: 600; }
   </style>
 </head>
 <body>
 <main>
   <h1>跨海光缆故障与抢修协调</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+  <p>最小演示页。抢修船动员后由调度员登记航行通告，渔政同意并取得回执后方可勘察。</p>
+  <div class="row">
+    <button id="load">加载记录与通告状态</button>
+    <button id="stats">查看状态统计</button>
+  </div>
+  <div class="cards" id="cards"></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
 const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
+async function getJson(path) {
   const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  return response.json();
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+document.getElementById("load").onclick = async () => {
+  const data = await getJson("/api/records?limit=20");
+  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  const cards = document.getElementById("cards");
+  cards.innerHTML = "";
+  for (const item of data.items) {
+    const n = item.navigational_notice || {};
+    const receipt = n.valid_receipt ? `<div class="ok">有效回执：${n.valid_receipt.receipt_no}</div><div>海域：${n.valid_receipt.sea_area}｜${n.valid_receipt.start_at.slice(0,16)} 至 ${n.valid_receipt.end_at.slice(0,16)}</div>` : "";
+    const block = n.blocked ? `<div class="block">阻塞：${n.block_reason}</div>` : "";
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `<div><strong>${item.reference}</strong> · ${item.state}</div>${receipt}${block}`;
+    cards.appendChild(card);
+  }
+};
+document.getElementById("stats").onclick = async () => {
+  document.getElementById("output").textContent = JSON.stringify(await getJson("/api/stats"), null, 2);
+};
 </script>
 </body>
 </html>

@@ -12,6 +12,8 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+NOTICES_RE = re.compile(r"^/api/records/(\d+)/notices$")
+NOTICE_ACTION_RE = re.compile(r"^/api/notices/(\d+)/actions/([a-z_]+)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -84,6 +86,10 @@ def make_handler(service: Any, static_dir: Path):
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
                     return
+                match = NOTICES_RE.match(parsed.path)
+                if match:
+                    self._send(200, {"items": service.list_notices(self._actor(), int(match.group(1)))})
+                    return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
@@ -98,6 +104,24 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                match = NOTICES_RE.match(parsed.path)
+                if match:
+                    notice = service.register_notice(self._actor(), int(match.group(1)), body.get("data", {}))
+                    self._send(201, notice)
+                    return
+                match = NOTICE_ACTION_RE.match(parsed.path)
+                if match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    notice_id = int(match.group(1))
+                    notice_action = match.group(2)
+                    if notice_action == "reschedule_notice":
+                        notice = service.reschedule_notice(self._actor(), notice_id, version, body.get("data", {}))
+                    else:
+                        notice = service.notice_action(self._actor(), notice_id, version, notice_action, body.get("data", {}))
+                    self._send(200, notice)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:
