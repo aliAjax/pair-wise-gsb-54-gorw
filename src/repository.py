@@ -47,8 +47,27 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS notices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    area TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    contact_no TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reject_reason TEXT NOT NULL DEFAULT '',
+                    receipt_no TEXT NOT NULL DEFAULT '',
+                    voided_receipt_no TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_notices_record ON notices(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_notices_area_status ON notices(area, status);
                 """
             )
 
@@ -141,6 +160,95 @@ class Repository:
         with self._connect() as connection:
             rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
         return {str(row["state"]): int(row["total"]) for row in rows}
+
+    def create_notice(self, record_id: int, data: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            cursor = connection.execute(
+                "INSERT INTO notices(record_id,area,start_time,end_time,contact_no,status,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (record_id, data["area"], data["start_time"], data["end_time"], data["contact_no"], "pending", actor_id, actor_id, now, now),
+            )
+            notice_id = int(cursor.lastrowid)
+            details = dict(details)
+            details["notice_id"] = notice_id
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, action, actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+            connection.commit()
+        return dict(result)
+
+    def get_notice(self, notice_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+        if row is None:
+            raise NotFound("通告不存在")
+        return dict(row)
+
+    def latest_notice(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM notices WHERE record_id=? ORDER BY id DESC LIMIT 1", (record_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def latest_notices(self, record_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not record_ids:
+            return {}
+        placeholders = ",".join("?" for _ in record_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT n.* FROM notices n JOIN (SELECT record_id, MAX(id) AS max_id FROM notices WHERE record_id IN (%s) GROUP BY record_id) t ON n.id=t.max_id" % placeholders,
+                list(record_ids),
+            ).fetchall()
+        return {int(row["record_id"]): dict(row) for row in rows}
+
+    def list_notices(self, record_id: int) -> List[Dict[str, Any]]:
+        self.get(record_id)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM notices WHERE record_id=? ORDER BY id DESC", (record_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_notices(self, exclude_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM notices WHERE status IN ('pending','approved')"
+        params: List[Any] = []
+        if exclude_id is not None:
+            sql += " AND id<>?"
+            params.append(int(exclude_id))
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_notice(self, notice_id: int, expected_status: str, updates: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now()
+        allowed = {"status", "reject_reason", "receipt_no", "voided_receipt_no", "revision", "start_time", "end_time", "contact_no", "area"}
+        changes = {key: value for key, value in updates.items() if key in allowed}
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("通告不存在")
+            if str(row["status"]) != str(expected_status):
+                connection.rollback()
+                raise Conflict("通告状态已变化，请刷新后重试")
+            assignments = ", ".join("%s=?" % key for key in changes)
+            connection.execute(
+                "UPDATE notices SET %s, updated_by=?, updated_at=? WHERE id=?" % assignments,
+                (*changes.values(), actor_id, now, notice_id),
+            )
+            record = connection.execute("SELECT version FROM records WHERE id=?", (row["record_id"],)).fetchone()
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (int(row["record_id"]), action, actor_id, int(record["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+            connection.commit()
+        return dict(result)
 
     def health(self) -> bool:
         try:

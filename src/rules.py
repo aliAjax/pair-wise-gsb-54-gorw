@@ -1,13 +1,18 @@
 """跨海光缆故障与抢修协调领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, iso_time, number, optional_text, parse_time, text, text_list
 
 
 INITIAL_STATE = "detected"
+TERMINAL_STATES = {"restored", "cancelled"}
 CREATE_ROLES = {'noc_operator'}
 ACTION_ROLES = {'approve': {'repair_manager'}, 'mobilize': {'vessel_master'}, 'survey': {'cable_engineer'}, 'splice': {'cable_engineer'}, 'test': {'noc_operator'}, 'restore': {'noc_operator', 'repair_manager'}, 'cancel': {'repair_manager'}}
 TRANSITIONS = {'approve': {'detected': 'approved'}, 'mobilize': {'approved': 'mobilized'}, 'survey': {'mobilized': 'surveyed'}, 'splice': {'surveyed': 'spliced'}, 'test': {'spliced': 'tested'}, 'restore': {'tested': 'restored'}, 'cancel': {'detected': 'cancelled', 'approved': 'cancelled', 'mobilized': 'cancelled'}}
+
+NOTICE_ACTION_ROLES = {'register': {'dispatcher'}, 'confirm': {'fishery_admin'}, 'reject': {'fishery_admin'}, 'resubmit': {'dispatcher'}, 'extend': {'dispatcher'}, 'revoke': {'dispatcher'}}
+NOTICE_TRANSITIONS = {'confirm': {'pending': 'approved'}, 'reject': {'pending': 'rejected'}, 'extend': {'pending': 'pending', 'approved': 'pending'}, 'revoke': {'pending': 'revoked', 'approved': 'revoked'}}
+ACTIVE_NOTICE_STATUSES = {"pending", "approved"}
 
 
 class DomainRules:
@@ -17,6 +22,8 @@ class DomainRules:
         all_roles = set(CREATE_ROLES)
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
+        for roles in NOTICE_ACTION_ROLES.values():
+            all_roles.update(roles)
         return role == "admin" or role in all_roles
 
     def role_can_create(self, role: str) -> bool:
@@ -24,6 +31,9 @@ class DomainRules:
 
     def role_can_action(self, role: str, action: str) -> bool:
         return role == "admin" or role in ACTION_ROLES.get(action, set())
+
+    def role_can_notice_action(self, role: str, action: str) -> bool:
+        return role == "admin" or role in NOTICE_ACTION_ROLES.get(action, set())
 
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         p = dict(payload)
@@ -63,7 +73,86 @@ class DomainRules:
             raise Conflict("当前状态不允许执行%s" % action)
         return allowed
 
-    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    def validate_notice(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        notice = {
+            "area": text(data, "area"),
+            "start_time": iso_time(data, "start_time"),
+            "end_time": iso_time(data, "end_time"),
+            "contact_no": text(data, "contact_no"),
+        }
+        if parse_time(notice["end_time"]) <= parse_time(notice["start_time"]):
+            raise ValidationError("结束时间必须大于开始时间")
+        return notice
+
+    def check_notice_overlap(self, candidate: Dict[str, Any], existing: Iterable[Dict[str, Any]]) -> None:
+        start = parse_time(candidate["start_time"])
+        end = parse_time(candidate["end_time"])
+        for item in existing:
+            if item["area"] != candidate["area"]:
+                continue
+            if start < parse_time(item["end_time"]) and end > parse_time(item["start_time"]):
+                raise Conflict("同一海域时段重叠的通告只能有一份")
+
+    def apply_notice_action(self, notice: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        if action not in NOTICE_TRANSITIONS:
+            raise ValidationError("未知通告操作%s" % action)
+        new_status = NOTICE_TRANSITIONS[action].get(notice["status"])
+        if new_status is None:
+            raise Conflict("当前通告状态不允许执行%s" % action)
+        data = dict(data or {})
+        updates: Dict[str, Any] = {"status": new_status}
+        if action == "confirm":
+            updates["receipt_no"] = optional_text(data, "receipt_no") or ("RCPT-%06d-%d" % (int(notice["id"]), int(notice.get("revision", 1))))
+            summary = "渔政已确认航行通告"
+        elif action == "reject":
+            updates["reject_reason"] = text(data, "reject_reason")
+            summary = "航行通告被退回"
+        elif action == "extend":
+            start = iso_time(data, "start_time")
+            end = iso_time(data, "end_time")
+            if parse_time(end) <= parse_time(start):
+                raise ValidationError("结束时间必须大于开始时间")
+            updates["start_time"] = start
+            updates["end_time"] = end
+            if notice["status"] == "approved":
+                updates["voided_receipt_no"] = notice.get("receipt_no", "")
+                updates["receipt_no"] = ""
+                updates["revision"] = int(notice.get("revision", 1)) + 1
+            summary = "作业期顺延，原回执失效"
+        else:
+            summary = "航行通告已撤销"
+        return new_status, updates, summary
+
+    def notice_blocking_reason(self, state: str, notice: Optional[Dict[str, Any]]) -> Optional[str]:
+        if state != "mobilized":
+            return None
+        if notice is None:
+            return "未登记航行通告，勘察不能开始"
+        status = notice["status"]
+        if status == "approved":
+            return None
+        if status == "pending":
+            return "航行通告待渔政确认，勘察不能开始"
+        if status == "rejected":
+            return "航行通告被退回：%s" % notice.get("reject_reason", "")
+        return "航行通告已撤销，需重新登记"
+
+    def notice_view(self, state: str, notice: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        view: Dict[str, Any] = {"status": "none", "area": "", "start_time": "", "end_time": "", "contact_no": "", "receipt_no": "", "reject_reason": ""}
+        if notice is not None:
+            view["id"] = notice["id"]
+            view["status"] = notice["status"]
+            view["area"] = notice["area"]
+            view["start_time"] = notice["start_time"]
+            view["end_time"] = notice["end_time"]
+            view["contact_no"] = notice["contact_no"]
+            view["reject_reason"] = notice.get("reject_reason", "")
+            if notice["status"] == "approved":
+                view["receipt_no"] = notice.get("receipt_no", "")
+        view["blocking_reason"] = self.notice_blocking_reason(state, notice)
+        return view
+
+    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any], notice: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], str]:
         new_state = self.require_transition(record, action)
         data = dict(data or {})
         p = dict(record["payload"])
@@ -83,6 +172,9 @@ class DomainRules:
             changes["vessel_name"] = text(data, "vessel_name")
             summary = "抢修船已动员"
         elif action == "survey":
+            reason = self.notice_blocking_reason(record["state"], notice)
+            if reason:
+                raise Conflict(reason)
             if not boolean(data, "survey_complete"):
                 raise ValidationError("勘察尚未完成")
             fault_km = number(data, "fault_location_km", 0)

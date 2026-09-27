@@ -1,5 +1,6 @@
 """领域基础类型与输入校验。"""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 
@@ -95,3 +96,22 @@ def text_list(data: Dict[str, Any], key: str, minimum: int = 0) -> List[str]:
     if len(value) < minimum:
         raise ValidationError("%s至少需要%s项" % (key, minimum))
     return [item.strip() for item in value]
+
+
+def parse_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("时间格式无效") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def iso_time(data: Dict[str, Any], key: str) -> str:
+    value = text(data, key)
+    try:
+        parsed = parse_time(value)
+    except ValidationError as exc:
+        raise ValidationError("%s必须是ISO时间" % key) from exc
+    return parsed.astimezone(timezone.utc).isoformat()
